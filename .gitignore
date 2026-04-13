@@ -1,0 +1,21 @@
+# API 키·로컬 설정 (절대 커밋하지 말 것)
+.env
+key.env
+*.env
+!.env.example
+
+# Streamlit 로컬 시크릿
+.streamlit/secrets.toml
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.Python
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
