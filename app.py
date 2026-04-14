@@ -604,6 +604,25 @@ def _resolve_font_for_pdf() -> Optional[Path]:
     return _download_korean_font_to_cache()
 
 
+def _wrap_plain_for_pdf(plain: str, max_chars: int = 44) -> str:
+    """insert_text는 줄바꿈 없는 한 줄이 가로로 넘침 → 긴 줄을 잘라 넣음(A4·10pt 기준)."""
+    lines_out: list[str] = []
+    w = max(16, max_chars)
+    for raw in plain.split("\n"):
+        line = raw.rstrip("\n")
+        if line == "":
+            lines_out.append("")
+            continue
+        if len(line) <= w:
+            lines_out.append(line)
+            continue
+        i = 0
+        while i < len(line):
+            lines_out.append(line[i : i + w])
+            i += w
+    return "\n".join(lines_out)
+
+
 def _pdf_bytes_with_fitz_impl(
     plain: str,
     font_path: Path,
@@ -706,7 +725,7 @@ def _fpdf_bytes_fallback(plain: str, font_path: Optional[Path]) -> Optional[byte
 
 def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
     """시스템 폰트 → 다운로드 정적 OTF 순으로 여러 경로 시도(PyMuPDF → fpdf2)."""
-    plain = _markdownish_to_plain(text)
+    plain = _wrap_plain_for_pdf(_markdownish_to_plain(text))
     seen: set[str] = set()
     paths: list[Path] = []
 
