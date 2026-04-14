@@ -4,3 +4,4 @@ python-dotenv
 pymupdf
 pdfplumber
 fpdf2
+reportlab>=4.0.0

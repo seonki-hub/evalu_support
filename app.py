@@ -701,8 +701,74 @@ def _markdownish_to_plain(text: str) -> str:
     return t
 
 
+def _strip_markdown_for_pdf(text: str) -> str:
+    """PDF·복사·검색용: 제목(#)·목록(*,-) 등을 제거해 일반 문장만 남김."""
+    t = text.strip()
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+    t = re.sub(r"__(.+?)__", r"\1", t)
+    t = re.sub(r"^#{1,6}\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^[\*\-•]\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^\d+\.\s+", "", t, flags=re.MULTILINE)
+    t = t.replace("`", "")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
 def _contains_hangul(s: str) -> bool:
     return bool(re.search(r"[\uac00-\ud7a3]", s))
+
+
+def _pdf_bytes_reportlab(plain: str, font_path: Path) -> Optional[bytes]:
+    """ReportLab TTFont: PDF 텍스트 레이어·복사/검색이 fpdf/PyMuPDF보다 안정적인 경우가 많음."""
+    try:
+        from io import BytesIO
+        from xml.sax.saxutils import escape
+
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    except ImportError:
+        return None
+
+    suf = font_path.suffix.lower()
+    if suf not in (".ttf", ".otf") or not font_path.is_file():
+        return None
+
+    try:
+        fname = "EmbedKR"
+        pdfmetrics.registerFont(TTFont(fname, str(font_path)))
+        style = ParagraphStyle(
+            name="Body",
+            fontName=fname,
+            fontSize=10,
+            leading=14,
+            spaceAfter=3,
+        )
+        buf = BytesIO()
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=A4,
+            leftMargin=16 * mm,
+            rightMargin=16 * mm,
+            topMargin=16 * mm,
+            bottomMargin=16 * mm,
+        )
+        story = []
+        for block in plain.split("\n\n"):
+            b = block.strip()
+            if not b:
+                story.append(Spacer(1, 6))
+                continue
+            safe = escape(b).replace("\n", "<br/>")
+            story.append(Paragraph(safe, style))
+        doc.build(story)
+        data = buf.getvalue()
+        return data if data else None
+    except Exception:
+        return None
 
 
 def _fpdf_bytes_fallback(plain: str, font_path: Optional[Path]) -> Optional[bytes]:
@@ -738,8 +804,8 @@ def _fpdf_bytes_fallback(plain: str, font_path: Optional[Path]) -> Optional[byte
 
 
 def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
-    """시스템 폰트 → 다운로드 정적 OTF 순으로 여러 경로 시도(PyMuPDF → fpdf2)."""
-    plain = _wrap_plain_for_pdf(_markdownish_to_plain(text))
+    """한글 폰트로 ReportLab → fpdf2 → PyMuPDF 순 시도(텍스트 인식·복사 우선)."""
+    plain = _wrap_plain_for_pdf(_strip_markdown_for_pdf(text))
     seen: set[str] = set()
     paths: list[Path] = []
 
@@ -756,8 +822,10 @@ def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
 
     for fp in paths:
         suf = fp.suffix.lower()
-        # TTF/OTF: fpdf2(uni=True)가 한글 임베딩에 유리 → 먼저 시도
         if suf in (".ttf", ".otf"):
+            b = _pdf_bytes_reportlab(plain, fp)
+            if b:
+                return b
             b = _fpdf_bytes_fallback(plain, fp)
             if b:
                 return b
