@@ -8,7 +8,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-_NOTO_CACHED: Optional[Path] = None
+# 런타임에 받아 둔 한글 폰트 경로(워커 프로세스 동안 유지)
+_EMBEDDED_FONT_CACHE: Optional[Path] = None
 
 # PDF 파싱용, 필요시 선택 사용
 import fitz  # PyMuPDF
@@ -538,26 +539,61 @@ def _resolve_korean_font_path() -> Optional[Path]:
     return None
 
 
-def _download_noto_kr_to_cache() -> Optional[Path]:
-    """Streamlit Cloud 등 시스템 폰트가 없을 때 한 번만 내려받아 캐시(약 10MB)."""
-    global _NOTO_CACHED
-    if _NOTO_CACHED is not None and _NOTO_CACHED.is_file():
-        return _NOTO_CACHED
-    cache = Path(tempfile.gettempdir()) / "evalu_support_NotoSansKR_wght.ttf"
-    if cache.is_file() and cache.stat().st_size > 1_000_000:
-        _NOTO_CACHED = cache
-        return cache
-    url = (
+def _http_download_binary(url: str, dest: Path, timeout: int = 180) -> bool:
+    """raw.githubusercontent.com 등에서 바이너리 저장. User-Agent 없으면 403 나는 경우가 있음."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; evalu-support/1.0; +https://streamlit.io)",
+                "Accept": "*/*",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        if len(data) < 50_000:
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return dest.is_file() and dest.stat().st_size > 50_000
+    except Exception:
+        return False
+
+
+def _download_korean_font_to_cache() -> Optional[Path]:
+    """시스템 폰트가 없을 때 정적 OTF 우선(가변 TTF보다 PyMuPDF/fpdf2 호환 좋음)."""
+    global _EMBEDDED_FONT_CACHE
+    if _EMBEDDED_FONT_CACHE is not None and _EMBEDDED_FONT_CACHE.is_file():
+        return _EMBEDDED_FONT_CACHE
+
+    tmp = Path(tempfile.gettempdir())
+    # 1) Noto Sans CJK KR Regular (정적 OTF, ~16MB)
+    otf_path = tmp / "evalu_support_NotoSansCJKkr-Regular.otf"
+    if otf_path.is_file() and otf_path.stat().st_size > 1_000_000:
+        _EMBEDDED_FONT_CACHE = otf_path
+        return otf_path
+
+    urls_otf = (
+        "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
+    )
+    for url in urls_otf:
+        if _http_download_binary(url, otf_path):
+            _EMBEDDED_FONT_CACHE = otf_path
+            return otf_path
+
+    # 2) 예비: Google Fonts 가변 TTF (~10MB)
+    ttf_path = tmp / "evalu_support_NotoSansKR_wght.ttf"
+    if ttf_path.is_file() and ttf_path.stat().st_size > 1_000_000:
+        _EMBEDDED_FONT_CACHE = ttf_path
+        return ttf_path
+    url_vf = (
         "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanskr/"
         "NotoSansKR%5Bwght%5D.ttf"
     )
-    try:
-        urllib.request.urlretrieve(url, cache)  # noqa: S310 — 고정 URL, 바이너리 폰트
-        if cache.is_file() and cache.stat().st_size > 1_000_000:
-            _NOTO_CACHED = cache
-            return cache
-    except Exception:
-        pass
+    if _http_download_binary(url_vf, ttf_path, timeout=240):
+        _EMBEDDED_FONT_CACHE = ttf_path
+        return ttf_path
+
     return None
 
 
@@ -565,11 +601,16 @@ def _resolve_font_for_pdf() -> Optional[Path]:
     p = _resolve_korean_font_path()
     if p is not None:
         return p
-    return _download_noto_kr_to_cache()
+    return _download_korean_font_to_cache()
 
 
-def _pdf_bytes_with_fitz(plain: str, font_path: Path) -> Optional[bytes]:
-    """PyMuPDF로 한글 PDF 생성. insert_text(fontfile=...) 방식(설치된 PyMuPDF 버전 호환)."""
+def _pdf_bytes_with_fitz_impl(
+    plain: str,
+    font_path: Path,
+    *,
+    ttc_fontname: Optional[str] = None,
+) -> Optional[bytes]:
+    """PyMuPDF insert_text: TTC는 일부 환경에서 fontname 지정이 필요."""
     ff = str(font_path)
     doc: Optional[fitz.Document] = None
     try:
@@ -588,11 +629,19 @@ def _pdf_bytes_with_fitz(plain: str, font_path: Path) -> Optional[bytes]:
                 page = doc.new_page()
                 y = margin + fontsize
                 max_y = page.rect.height - margin
-            page.insert_text((x0, y), s, fontfile=ff, fontsize=fontsize)
+            if ttc_fontname:
+                page.insert_text(
+                    (x0, y),
+                    s,
+                    fontfile=ff,
+                    fontsize=fontsize,
+                    fontname=ttc_fontname,
+                )
+            else:
+                page.insert_text((x0, y), s, fontfile=ff, fontsize=fontsize)
             y += line_height
 
-        out = doc.tobytes()
-        return out
+        return doc.tobytes()
     except Exception:
         return None
     finally:
@@ -601,6 +650,19 @@ def _pdf_bytes_with_fitz(plain: str, font_path: Path) -> Optional[bytes]:
                 doc.close()
             except Exception:
                 pass
+
+
+def _pdf_bytes_with_fitz(plain: str, font_path: Path) -> Optional[bytes]:
+    """PyMuPDF로 한글 PDF. TTC는 fontname 보조 시도."""
+    b = _pdf_bytes_with_fitz_impl(plain, font_path, ttc_fontname=None)
+    if b:
+        return b
+    if font_path.suffix.lower() == ".ttc":
+        for name in ("NotoSansCJK-Regular", "NotoSansCJK-Regular.ttc", "NotoSansCJKkr-Regular"):
+            b = _pdf_bytes_with_fitz_impl(plain, font_path, ttc_fontname=name)
+            if b:
+                return b
+    return None
 
 
 def _markdownish_to_plain(text: str) -> str:
@@ -643,13 +705,30 @@ def _fpdf_bytes_fallback(plain: str, font_path: Optional[Path]) -> Optional[byte
 
 
 def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
+    """시스템 폰트 → 다운로드 정적 OTF 순으로 여러 경로 시도(PyMuPDF → fpdf2)."""
     plain = _markdownish_to_plain(text)
-    font_path = _resolve_font_for_pdf()
-    if font_path and font_path.is_file():
-        b = _pdf_bytes_with_fitz(plain, font_path)
+    seen: set[str] = set()
+    paths: list[Path] = []
+
+    def _add(p: Optional[Path]) -> None:
+        if p and p.is_file():
+            key = str(p.resolve())
+            if key not in seen:
+                seen.add(key)
+                paths.append(p)
+
+    _add(_resolve_font_for_pdf())
+    # 시스템에 TTC만 있어 실패하는 경우 대비해, 정적 OTF를 한 번 더 후보에 넣음
+    _add(_download_korean_font_to_cache())
+
+    for fp in paths:
+        b = _pdf_bytes_with_fitz(plain, fp)
         if b:
             return b
-    return _fpdf_bytes_fallback(plain, font_path if font_path and font_path.is_file() else None)
+        b = _fpdf_bytes_fallback(plain, fp)
+        if b:
+            return b
+    return None
 
 
 def _render_analysis_result(result: str) -> None:
