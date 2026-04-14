@@ -1,10 +1,14 @@
 import html
 import re
 import time
+import tempfile
+import urllib.request
 import streamlit as st
 import os
 from pathlib import Path
 from typing import Optional
+
+_NOTO_CACHED: Optional[Path] = None
 
 # PDF 파싱용, 필요시 선택 사용
 import fitz  # PyMuPDF
@@ -508,7 +512,7 @@ def extract_text_from_pdf(file):
 
 
 def _resolve_korean_font_path() -> Optional[Path]:
-    """한글 PDF용 TTF/OTF. 프로젝트 fonts/ → 윈도우 맑은고딕 → Linux Noto 순."""
+    """한글 PDF용 TTF/OTF/TTC. 프로젝트 fonts/ → 윈도우 맑은고딕 → Linux(나눔·Noto) → 캐시."""
     for rel in (
         "fonts/NotoSansKR-Regular.otf",
         "fonts/NotoSansKR-Regular.ttf",
@@ -521,13 +525,82 @@ def _resolve_korean_font_path() -> Optional[Path]:
     if win.is_file():
         return win
     for linux in (
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
     ):
         lp = Path(linux)
         if lp.is_file():
             return lp
     return None
+
+
+def _download_noto_kr_to_cache() -> Optional[Path]:
+    """Streamlit Cloud 등 시스템 폰트가 없을 때 한 번만 내려받아 캐시(약 10MB)."""
+    global _NOTO_CACHED
+    if _NOTO_CACHED is not None and _NOTO_CACHED.is_file():
+        return _NOTO_CACHED
+    cache = Path(tempfile.gettempdir()) / "evalu_support_NotoSansKR_wght.ttf"
+    if cache.is_file() and cache.stat().st_size > 1_000_000:
+        _NOTO_CACHED = cache
+        return cache
+    url = (
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanskr/"
+        "NotoSansKR%5Bwght%5D.ttf"
+    )
+    try:
+        urllib.request.urlretrieve(url, cache)  # noqa: S310 — 고정 URL, 바이너리 폰트
+        if cache.is_file() and cache.stat().st_size > 1_000_000:
+            _NOTO_CACHED = cache
+            return cache
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_font_for_pdf() -> Optional[Path]:
+    p = _resolve_korean_font_path()
+    if p is not None:
+        return p
+    return _download_noto_kr_to_cache()
+
+
+def _pdf_bytes_with_fitz(plain: str, font_path: Path) -> Optional[bytes]:
+    """PyMuPDF로 한글 PDF 생성. insert_text(fontfile=...) 방식(설치된 PyMuPDF 버전 호환)."""
+    ff = str(font_path)
+    doc: Optional[fitz.Document] = None
+    try:
+        doc = fitz.open()
+        margin = 50
+        fontsize = 10
+        line_height = fontsize * 1.45
+        x0 = margin
+        page = doc.new_page()
+        y = margin + fontsize
+        max_y = page.rect.height - margin
+
+        for line in plain.split("\n"):
+            s = line.strip() or " "
+            if y > max_y - line_height:
+                page = doc.new_page()
+                y = margin + fontsize
+                max_y = page.rect.height - margin
+            page.insert_text((x0, y), s, fontfile=ff, fontsize=fontsize)
+            y += line_height
+
+        out = doc.tobytes()
+        return out
+    except Exception:
+        return None
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def _markdownish_to_plain(text: str) -> str:
@@ -540,31 +613,43 @@ def _markdownish_to_plain(text: str) -> str:
     return t
 
 
-def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
+def _fpdf_bytes_fallback(plain: str, font_path: Optional[Path]) -> Optional[bytes]:
+    """fpdf2: 한글은 TTF/OTF가 있을 때만. output()은 bytes 또는 str 반환 모두 처리."""
     if FPDF is None:
         return None
-    font_path = _resolve_korean_font_path()
     try:
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=14)
         pdf.add_page()
-        if font_path and font_path.suffix.lower() in (".ttf", ".otf"):
+        suf = font_path.suffix.lower() if font_path else ""
+        if font_path and font_path.is_file() and suf in (".ttf", ".otf"):
             pdf.add_font("KR", "", str(font_path), uni=True)
             pdf.set_font("KR", size=10)
         else:
             pdf.set_font("Helvetica", size=10)
-        plain = _markdownish_to_plain(text)
         for block in plain.split("\n\n"):
             for line in block.split("\n"):
-                line = line.strip() or " "
-                pdf.multi_cell(0, 5.5, line)
+                ln = line.strip() or " "
+                pdf.multi_cell(0, 5.5, ln)
             pdf.ln(3)
         out = pdf.output(dest="S")
         if not out:
             return None
-        return out.encode("latin1")
+        if isinstance(out, (bytes, bytearray)):
+            return bytes(out)
+        return str(out).encode("latin1")
     except Exception:
         return None
+
+
+def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
+    plain = _markdownish_to_plain(text)
+    font_path = _resolve_font_for_pdf()
+    if font_path and font_path.is_file():
+        b = _pdf_bytes_with_fitz(plain, font_path)
+        if b:
+            return b
+    return _fpdf_bytes_fallback(plain, font_path if font_path and font_path.is_file() else None)
 
 
 def _render_analysis_result(result: str) -> None:
@@ -594,7 +679,8 @@ def _render_analysis_result(result: str) -> None:
         else:
             st.caption(
                 "PDF를 만들 수 없습니다. 왼쪽 **메모장용** 파일로 저장한 뒤 인쇄하거나, "
-                "`fonts/NotoSansKR-Regular.otf` 등을 확인하세요."
+                "잠시 후 다시 시도해 보세요(첫 PDF 생성 시 폰트를 받아오는 경우가 있습니다). "
+                "로컬에서는 `fonts/NotoSansKR-Regular.otf` 등을 `app.py`와 같은 폴더의 **fonts/** 에 두면 됩니다."
             )
     st.caption(
         "내용은 위 화면과 동일합니다. 메모장에서 바로 고칠 수 있고, "
