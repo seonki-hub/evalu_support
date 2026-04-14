@@ -718,18 +718,113 @@ def _contains_hangul(s: str) -> bool:
     return bool(re.search(r"[\uac00-\ud7a3]", s))
 
 
-def _pdf_bytes_reportlab(plain: str, font_path: Path) -> Optional[bytes]:
-    """ReportLab TTFont: PDF 텍스트 레이어·복사/검색이 fpdf/PyMuPDF보다 안정적인 경우가 많음."""
+def _rl_escape_xml(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _rl_inline_bold_from_md(s: str) -> str:
+    """`**굵게**` → ReportLab Paragraph용 `<b>` (XML 이스케이프 포함)."""
+    parts = re.split(r"(\*\*.+?\*\*)", s)
+    out: list[str] = []
+    for p in parts:
+        if len(p) >= 4 and p.startswith("**") and p.endswith("**"):
+            out.append("<b>" + _rl_escape_xml(p[2:-2]) + "</b>")
+        else:
+            out.append(_rl_escape_xml(p))
+    return "".join(parts)
+
+
+def _reportlab_story_markdown(md: str, font_name: str):
+    """웹 `st.markdown`과 비슷하게: ##/### 제목, 글머리, 본문."""
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph, Spacer
+
+    body = ParagraphStyle(
+        name="RLBody",
+        fontName=font_name,
+        fontSize=10,
+        leading=14,
+        spaceAfter=4,
+        textColor=colors.HexColor("#1a1a1a"),
+    )
+    h2 = ParagraphStyle(
+        name="RLH2",
+        fontName=font_name,
+        fontSize=14,
+        leading=18,
+        spaceBefore=10,
+        spaceAfter=6,
+        textColor=colors.HexColor("#2471a3"),
+    )
+    h3 = ParagraphStyle(
+        name="RLH3",
+        fontName=font_name,
+        fontSize=12,
+        leading=16,
+        spaceBefore=8,
+        spaceAfter=4,
+        textColor=colors.HexColor("#2471a3"),
+    )
+    h1 = ParagraphStyle(
+        name="RLH1",
+        fontName=font_name,
+        fontSize=16,
+        leading=20,
+        spaceBefore=12,
+        spaceAfter=8,
+        textColor=colors.HexColor("#152c52"),
+    )
+    bullet = ParagraphStyle(
+        name="RLBullet",
+        parent=body,
+        leftIndent=16,
+        firstLineIndent=0,
+        bulletIndent=0,
+        spaceAfter=3,
+    )
+
+    story = []
+    for raw in md.split("\n"):
+        s = raw.strip()
+        if not s:
+            story.append(Spacer(1, 5))
+            continue
+        if s in ("---", "***", "___"):
+            story.append(Spacer(1, 10))
+            continue
+        hm = re.match(r"^(#{1,6})\s+(.+)$", s)
+        if hm:
+            level = len(hm.group(1))
+            txt = hm.group(2).strip()
+            if txt:
+                if level == 1:
+                    story.append(Paragraph(_rl_inline_bold_from_md(txt), h1))
+                elif level == 2:
+                    story.append(Paragraph(_rl_inline_bold_from_md(txt), h2))
+                else:
+                    story.append(Paragraph(_rl_inline_bold_from_md(txt), h3))
+            continue
+        if re.match(r"^[\*\-•]\s*", s):
+            txt = re.sub(r"^[\*\-•]\s*", "", s).strip()
+            story.append(Paragraph("• " + _rl_inline_bold_from_md(txt), bullet))
+        elif re.match(r"^\d+\.\s+", s):
+            story.append(Paragraph(_rl_inline_bold_from_md(s), bullet))
+        else:
+            story.append(Paragraph(_rl_inline_bold_from_md(s), body))
+    return story
+
+
+def _pdf_bytes_reportlab(md_text: str, font_path: Path) -> Optional[bytes]:
+    """ReportLab: 마크다운 느낌(제목·목록·굵게) 유지 + 텍스트 레이어."""
     try:
         from io import BytesIO
-        from xml.sax.saxutils import escape
 
         from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.units import mm
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+        from reportlab.platypus import SimpleDocTemplate
     except ImportError:
         return None
 
@@ -740,13 +835,6 @@ def _pdf_bytes_reportlab(plain: str, font_path: Path) -> Optional[bytes]:
     try:
         fname = "EmbedKR"
         pdfmetrics.registerFont(TTFont(fname, str(font_path)))
-        style = ParagraphStyle(
-            name="Body",
-            fontName=fname,
-            fontSize=10,
-            leading=14,
-            spaceAfter=3,
-        )
         buf = BytesIO()
         doc = SimpleDocTemplate(
             buf,
@@ -756,14 +844,9 @@ def _pdf_bytes_reportlab(plain: str, font_path: Path) -> Optional[bytes]:
             topMargin=16 * mm,
             bottomMargin=16 * mm,
         )
-        story = []
-        for block in plain.split("\n\n"):
-            b = block.strip()
-            if not b:
-                story.append(Spacer(1, 6))
-                continue
-            safe = escape(b).replace("\n", "<br/>")
-            story.append(Paragraph(safe, style))
+        story = _reportlab_story_markdown(md_text.strip(), fname)
+        if not story:
+            return None
         doc.build(story)
         data = buf.getvalue()
         return data if data else None
@@ -804,7 +887,7 @@ def _fpdf_bytes_fallback(plain: str, font_path: Optional[Path]) -> Optional[byte
 
 
 def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
-    """한글 폰트로 ReportLab → fpdf2 → PyMuPDF 순 시도(텍스트 인식·복사 우선)."""
+    """ReportLab은 마크다운 구조 유지, fpdf/PyMuPDF는 평문 래핑."""
     plain = _wrap_plain_for_pdf(_strip_markdown_for_pdf(text))
     seen: set[str] = set()
     paths: list[Path] = []
@@ -823,7 +906,7 @@ def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
     for fp in paths:
         suf = fp.suffix.lower()
         if suf in (".ttf", ".otf"):
-            b = _pdf_bytes_reportlab(plain, fp)
+            b = _pdf_bytes_reportlab(text, fp)
             if b:
                 return b
             b = _fpdf_bytes_fallback(plain, fp)
