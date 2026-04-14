@@ -4,6 +4,7 @@ import time
 import streamlit as st
 import os
 from pathlib import Path
+from typing import Optional
 
 # PDF 파싱용, 필요시 선택 사용
 import fitz  # PyMuPDF
@@ -103,13 +104,16 @@ except ValueError:
 
 if not api_key:
     try:
-        api_key = st.secrets["GEMINI_API_KEY"] if "GEMINI_API_KEY" in st.secrets else None
+        api_key = st.secrets.get("GEMINI_API_KEY")  # type: ignore[union-attr]
     except Exception:
         api_key = None
 if not api_key:
     st.warning("`.env` 또는 `key.env`, 또는 secrets에 GEMINI_API_KEY를 설정하세요.")
 else:
-    genai.configure(api_key=api_key)
+    try:
+        genai.configure(api_key=api_key)
+    except Exception as e:
+        st.error(f"Gemini API 초기화 중 오류가 났습니다. Secrets의 키 형식을 확인해 주세요. ({e})")
 
 
 # 같은 프롬프트라도 문장만 흔들리지 않도록 낮은 temperature(환경변수로 조정 가능)
@@ -122,7 +126,7 @@ except ValueError:
 def _generate_content_with_retry(model: genai.GenerativeModel, prompt: str):
     """무료 티어 분당 한도(429) 시 응답에 안내된 대기 시간 후 재시도."""
     gen_cfg = {"temperature": _GEMINI_TEMP, "top_p": 0.9}
-    last_exc: Exception | None = None
+    last_exc: Optional[Exception] = None
     for attempt in range(_GEMINI_RETRY):
         try:
             return model.generate_content(prompt, generation_config=gen_cfg)
@@ -159,15 +163,12 @@ UPPER_GUIDANCE_MD_REL = [
 _raw_upper = os.getenv("UPPER_GUIDANCE_PDF")
 if not _raw_upper:
     try:
-        _raw_upper = (
-            str(st.secrets["UPPER_GUIDANCE_PDF"])
-            if "UPPER_GUIDANCE_PDF" in st.secrets
-            else None
-        )
+        v = st.secrets.get("UPPER_GUIDANCE_PDF")  # type: ignore[union-attr]
+        _raw_upper = str(v) if v is not None else None
     except Exception:
         _raw_upper = None
 
-UPPER_GUIDANCE_OVERRIDE: Path | None = None
+UPPER_GUIDANCE_OVERRIDE: Optional[Path] = None
 if _raw_upper:
     _p = Path(_raw_upper)
     UPPER_GUIDANCE_OVERRIDE = _p.resolve() if _p.is_absolute() else (_APP_DIR / _raw_upper).resolve()
@@ -506,7 +507,7 @@ def extract_text_from_pdf(file):
     return text
 
 
-def _resolve_korean_font_path() -> Path | None:
+def _resolve_korean_font_path() -> Optional[Path]:
     """한글 PDF용 TTF/OTF. 프로젝트 fonts/ → 윈도우 맑은고딕 → Linux Noto 순."""
     for rel in (
         "fonts/NotoSansKR-Regular.otf",
@@ -539,7 +540,7 @@ def _markdownish_to_plain(text: str) -> str:
     return t
 
 
-def _build_analysis_pdf_bytes(text: str) -> bytes | None:
+def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
     if FPDF is None:
         return None
     font_path = _resolve_korean_font_path()
