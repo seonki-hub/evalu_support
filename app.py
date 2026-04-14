@@ -655,9 +655,16 @@ def _pdf_bytes_with_fitz_impl(
                     fontfile=ff,
                     fontsize=fontsize,
                     fontname=ttc_fontname,
+                    set_simple=0,
                 )
             else:
-                page.insert_text((x0, y), s, fontfile=ff, fontsize=fontsize)
+                page.insert_text(
+                    (x0, y),
+                    s,
+                    fontfile=ff,
+                    fontsize=fontsize,
+                    set_simple=0,
+                )
             y += line_height
 
         return doc.tobytes()
@@ -694,16 +701,23 @@ def _markdownish_to_plain(text: str) -> str:
     return t
 
 
+def _contains_hangul(s: str) -> bool:
+    return bool(re.search(r"[\uac00-\ud7a3]", s))
+
+
 def _fpdf_bytes_fallback(plain: str, font_path: Optional[Path]) -> Optional[bytes]:
-    """fpdf2: 한글은 TTF/OTF가 있을 때만. output()은 bytes 또는 str 반환 모두 처리."""
+    """fpdf2: 한글은 TTF/OTF 임베딩(uni=True). Helvetica로 한글을 찍으면 뷰어에서 깨짐 → 사용 안 함."""
     if FPDF is None:
+        return None
+    suf = font_path.suffix.lower() if font_path else ""
+    has_kr_font = bool(font_path and font_path.is_file() and suf in (".ttf", ".otf"))
+    if _contains_hangul(plain) and not has_kr_font:
         return None
     try:
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=14)
         pdf.add_page()
-        suf = font_path.suffix.lower() if font_path else ""
-        if font_path and font_path.is_file() and suf in (".ttf", ".otf"):
+        if has_kr_font:
             pdf.add_font("KR", "", str(font_path), uni=True)
             pdf.set_font("KR", size=10)
         else:
@@ -741,12 +755,20 @@ def _build_analysis_pdf_bytes(text: str) -> Optional[bytes]:
     _add(_download_korean_font_to_cache())
 
     for fp in paths:
-        b = _pdf_bytes_with_fitz(plain, fp)
-        if b:
-            return b
-        b = _fpdf_bytes_fallback(plain, fp)
-        if b:
-            return b
+        suf = fp.suffix.lower()
+        # TTF/OTF: fpdf2(uni=True)가 한글 임베딩에 유리 → 먼저 시도
+        if suf in (".ttf", ".otf"):
+            b = _fpdf_bytes_fallback(plain, fp)
+            if b:
+                return b
+            b = _pdf_bytes_with_fitz(plain, fp)
+            if b:
+                return b
+        else:
+            b = _pdf_bytes_with_fitz(plain, fp)
+            if b:
+                return b
+            b = _fpdf_bytes_fallback(plain, fp)
     return None
 
 
